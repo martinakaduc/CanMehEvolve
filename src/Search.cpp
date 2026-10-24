@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <random>
@@ -50,7 +51,6 @@
 
 using utilities::ChatClientConfig;
 using utilities::ModelReply;
-using utilities::requestModelReply;
 using utilities::readFile;
 using utilities::writeFile;
 using utilities::truncate;
@@ -358,6 +358,108 @@ struct CodeBlock {
   std::string text;
 };
 
+std::string trim(const std::string& text) {
+  const auto first = text.find_first_not_of(" \t\r\n");
+  return first == std::string::npos ? std::string{} :
+      text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+}
+
+// Reasoning models sometimes put their analysis before the final answer.
+// Never select a code example from that analysis instead of the answer.
+std::string answerText(std::string text) {
+  text = trim(text);
+  if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) text = trim(text.substr(3));
+  for (const auto* tag : {"think", "analysis"}) {
+    const auto opening = std::string{"<"} + tag + ">";
+    const auto closing = std::string{"</"} + tag + ">";
+    while (text.rfind(opening, 0) == 0) {
+      const auto end = text.find(closing, opening.size());
+      if (end == std::string::npos) return {};
+      text = trim(text.substr(end + closing.size()));
+    }
+  }
+  if (text.rfind("<final>", 0) == 0) {
+    const auto end = text.find("</final>", 7);
+    if (end == std::string::npos) return {};
+    text = trim(text.substr(7, end - 7));
+  }
+  return text;
+}
+
+// A cheap truncation check, not a C++ parser. Ignore comments and literals so
+// braces in either cannot make an incomplete function appear complete.
+bool completeFunction(const std::string& text) {
+  auto delimiters = std::vector<char>{};
+  auto skeleton = std::string{};
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    const auto c = text[i];
+    if (text.compare(i, 2, "//") == 0) {
+      const auto end = text.find('\n', i + 2);
+      if (end == std::string::npos) break;
+      i = end;
+      skeleton += '\n';
+    } else if (text.compare(i, 2, "/*") == 0) {
+      const auto end = text.find("*/", i + 2);
+      if (end == std::string::npos) return false;
+      i = end + 1;
+      skeleton += ' ';
+    } else if (text.compare(i, 2, "R\"") == 0) {
+      const auto start = text.find('(', i + 2);
+      if (start == std::string::npos || start - i > 18) return false;
+      const auto closing = ")" + text.substr(i + 2, start - i - 2) + "\"";
+      const auto end = text.find(closing, start + 1);
+      if (end == std::string::npos) return false;
+      i = end + closing.size() - 1;
+      skeleton += ' ';
+    } else if (c == '\"' || (c == '\'' && !(i > 0 &&
+               std::isdigit(static_cast<unsigned char>(text[i - 1])) &&
+               i + 1 < text.size() && std::isalnum(static_cast<unsigned char>(text[i + 1]))))) {
+      auto closed = false;
+      while (++i < text.size()) {
+        if (text[i] == '\\') ++i;
+        else if (text[i] == c) { closed = true; break; }
+      }
+      if (!closed) return false;
+      skeleton += ' ';
+    } else {
+      skeleton += c;
+      if (c == '(' || c == '[' || c == '{') delimiters.push_back(c);
+      if (c == ')' || c == ']' || c == '}') {
+        const auto opening = c == ')' ? '(' : c == ']' ? '[' : '{';
+        if (delimiters.empty() || delimiters.back() != opening) return false;
+        delimiters.pop_back();
+      }
+    }
+  }
+  skeleton = trim(skeleton);
+  const auto body = skeleton.find('{');
+  return delimiters.empty() && body != std::string::npos &&
+      skeleton.find('(') < body && !skeleton.empty() && skeleton.back() == '}';
+}
+
+bool includeLine(const std::string& line) {
+  const auto text = trim(line);
+  if (text.empty() || text.front() != '#') return false;
+  const auto directive = trim(text.substr(1));
+  return directive.rfind("include", 0) == 0 && directive.size() > 7 &&
+      (std::isspace(static_cast<unsigned char>(directive[7])) ||
+       directive[7] == '<' || directive[7] == '\"');
+}
+
+std::string takeIncludes(const std::string& text, std::string* includes) {
+  auto lines = std::istringstream(text);
+  auto line = std::string{};
+  auto code = std::string{};
+  while (std::getline(lines, line)) {
+    if (includeLine(line)) {
+      // Harness splice recognizes the canonical #include spelling only.
+      *includes += "#" + trim(trim(line).substr(1)) + "\n";
+    }
+    else code += line + "\n";
+  }
+  return code;
+}
+
 std::vector<CodeBlock> codeBlocks(const std::string& reply) {
   auto blocks = std::vector<CodeBlock>{};
   auto lines = std::istringstream(reply);
@@ -390,50 +492,191 @@ std::vector<CodeBlock> codeBlocks(const std::string& reply) {
 
 /// Reads the replacement text and the include lines out of one model reply.
 ///
-/// splitReply takes the first fenced block whose info string does not contain
-/// "include" as the replacement, and the first block whose info string does
-/// contain it as the include lines, which `CanMehHarness splice --includes`
-/// merges into the file's include block.
-///
-/// splitReply clears code when the text contains no brace, because every
-/// region is a function body and splice replaces its signature and braces as
-/// well, so no usable replacement lacks one. One model reply held the word
-/// includes and two #include lines and no function at all; splitReply returned
-/// that text, splice wrote it into the tree and the compiler reported
-/// "'includes' does not name a type", which CanMehSearch then recorded as
-/// stage compile for a model that had written no code.
+/// Accept C++ or untagged fences, bare functions, and JSON objects containing
+/// code/replacement and includes. Skip explanation/include-only blocks when
+/// looking for the function. An unclosed fence or function is not a candidate.
 void splitReply(const std::string& reply, std::string* code, std::string* includes) {
   code->clear();
   includes->clear();
-  const auto blocks = codeBlocks(reply);
-  auto foundCode = false;
-  auto foundIncludes = false;
+  const auto answer = answerText(reply);
+  auto blocks = codeBlocks(answer);
+  if (blocks.empty() && answer.find("```") == std::string::npos &&
+      answer.find("~~~") == std::string::npos) blocks.push_back({"", answer});
+  // Prefer explicitly tagged C++ over untagged examples elsewhere in a reply.
+  auto cpp = [](const std::string& tag) {
+    return tag == "cpp" || tag == "c++" || tag == "cxx" || tag == "cc" ||
+        tag == "c" || tag == "cplusplus" || tag == "cpp17" || tag == "c++17";
+  };
+  for (auto& block : blocks) {
+    block.tag = trim(block.tag);
+    std::transform(block.tag.begin(), block.tag.end(), block.tag.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    block.tag = block.tag.substr(0, block.tag.find_first_of(" \t"));
+    if (block.tag.size() > 3 && block.tag.rfind("{.", 0) == 0 && block.tag.back() == '}')
+      block.tag = block.tag.substr(2, block.tag.size() - 3);
+  }
+  std::stable_sort(blocks.begin(), blocks.end(), [&](const CodeBlock& a, const CodeBlock& b) {
+    return cpp(a.tag) && !cpp(b.tag);
+  });
   for (const auto& block : blocks) {
-    auto tag = block.tag;
-    std::transform(tag.begin(), tag.end(), tag.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (tag.find("include") != std::string::npos) {
-      if (!foundIncludes) *includes = block.text;
-      foundIncludes = true;
-    } else if (!foundCode) {
-      *code = block.text;
-      foundCode = true;
+    auto text = block.text;
+    auto extraIncludes = std::string{};
+    if (block.tag == "json" || (!trim(text).empty() && trim(text).front() == '{')) {
+      const auto object = json::parse(text, nullptr, false);
+      if (object.is_object()) {
+        text.clear();
+        for (const auto* key : {"replacement", "code", "function"})
+          if (object.contains(key) && object.at(key).is_string()) {
+            text = object.at(key).get<std::string>();
+            break;
+          }
+        if (object.contains("includes")) {
+          const auto& value = object.at("includes");
+          if (value.is_string()) takeIncludes(value.get<std::string>(), &extraIncludes);
+          else if (value.is_array())
+            for (const auto& line : value)
+              if (line.is_string()) takeIncludes(line.get<std::string>(), &extraIncludes);
+        }
+      } else if (block.tag == "json") continue;
+    }
+    if (!block.tag.empty() && !cpp(block.tag) && block.tag != "json" &&
+        block.tag.find("include") == std::string::npos) continue;
+    const auto replacement = takeIncludes(text, &extraIncludes);
+    // Includes accompanying a rejected alternative must not leak into the
+    // selected function. Standalone include blocks apply to the selected code.
+    if (trim(replacement).empty() || block.tag.find("include") != std::string::npos)
+      *includes += extraIncludes;
+    else if (code->empty() && completeFunction(replacement)) {
+      *code = replacement;
+      *includes += extraIncludes;
     }
   }
-  if (blocks.empty() && reply.find("```") == std::string::npos &&
-      reply.find("~~~") == std::string::npos) *code = reply;
-  auto text = std::istringstream(*code);
-  auto line = std::string{};
-  auto replacement = std::string{};
-  while (std::getline(text, line)) {
-    const auto start = line.find_first_not_of(" \t");
-    if (start != std::string::npos && line.compare(start, 8, "#include") == 0)
-      *includes += line + "\n";
-    else
-      replacement += line + "\n";
+}
+
+struct SearchModelReply : ModelReply {
+  std::string raw;
+  long httpStatus = 0;
+  std::string finishReason;
+  std::string contentSource;
+};
+
+// Text content can be a string or an array of text parts. Ignore non-text
+// parts (images, reasoning, refusals), rather than dumping JSON into C++.
+std::string responseText(const json& value) {
+  if (value.is_string()) return value.get<std::string>();
+  auto result = std::string{};
+  if (value.is_array()) {
+    for (const auto& part : value) {
+      if (part.is_string()) result += part.get<std::string>();
+      else if (part.is_object() && part.contains("text") &&
+               (!part.contains("type") || part.at("type") == "text" || part.at("type") == "output_text"))
+        result += responseText(part.at("text"));
+    }
+  } else if (value.is_object()) {
+    if (value.contains("text") && (!value.contains("type") || value.at("type") == "text" ||
+                                  value.at("type") == "output_text"))
+      result = responseText(value.at("text"));
+    else if (value.contains("value") && value.at("value").is_string())
+      result = value.at("value").get<std::string>();
   }
-  *code = replacement;
-  if (code->find('{') == std::string::npos || code->find('}') == std::string::npos) code->clear();
+  return result;
+}
+
+SearchModelReply parseModelResponse(const std::string& raw) {
+  auto reply = SearchModelReply{};
+  reply.raw = raw;
+  const auto parsed = json::parse(raw, nullptr, false);
+  if (!parsed.is_object()) {
+    reply.error = "malformed response: expected a JSON object";
+    return reply;
+  }
+  // Preserve billed usage even when no usable final answer was returned.
+  if (parsed.contains("usage") && parsed.at("usage").is_object()) {
+    const auto& usage = parsed.at("usage");
+    auto count = [&](const char* key) -> long long {
+      if (!usage.contains(key) || !usage.at(key).is_number_integer()) return 0;
+      const auto& value = usage.at(key);
+      if (value.is_number_unsigned() && value.get<std::uint64_t>() >
+          static_cast<std::uint64_t>(std::numeric_limits<long long>::max())) return 0;
+      return std::max(0LL, value.get<long long>());
+    };
+    reply.promptTokens = count("prompt_tokens");
+    reply.completionTokens = count("completion_tokens");
+    reply.totalTokens = count("total_tokens");
+  }
+  if (!parsed.contains("choices") || !parsed.at("choices").is_array() ||
+      parsed.at("choices").empty() || !parsed.at("choices").at(0).is_object()) {
+    reply.error = "malformed response: missing choices[0]";
+    return reply;
+  }
+  const auto& choice = parsed.at("choices").at(0);
+  if (choice.contains("finish_reason") && choice.at("finish_reason").is_string())
+    reply.finishReason = choice.at("finish_reason").get<std::string>();
+  auto select = [&](const json& object, const char* key, const std::string& source) {
+    if (!trim(reply.content).empty() || !object.is_object() || !object.contains(key)) return;
+    const auto text = responseText(object.at(key));
+    if (!trim(text).empty()) { reply.content = text; reply.contentSource = source; }
+  };
+  const auto message = choice.contains("message") ? choice.at("message") : json{};
+  select(message, "content", "message.content");
+  select(message, "text", "message.text");
+  select(choice, "text", "choices[0].text");
+  // Some compatible endpoints place the final fenced answer in the reasoning
+  // field. Use it only if it actually contains a complete fenced replacement.
+  if (trim(reply.content).empty() && message.is_object()) {
+    for (const auto* key : {"reasoning_content", "reasoning"}) {
+      if (!message.contains(key)) continue;
+      const auto text = responseText(message.at(key));
+      auto code = std::string{};
+      auto includes = std::string{};
+      if (!codeBlocks(answerText(text)).empty()) splitReply(text, &code, &includes);
+      if (!code.empty()) { reply.content = text; reply.contentSource = std::string{"message."} + key; break; }
+    }
+  }
+  if (reply.finishReason == "length" || reply.finishReason == "max_tokens")
+    reply.error = "reply reached the token limit (finish_reason=" + reply.finishReason +
+        "); increase --llm-max-tokens";
+  else if (reply.finishReason == "content_filter")
+    reply.error = "reply was filtered (finish_reason=content_filter)";
+  else if (trim(reply.content).empty())
+    reply.error = "reply contains no text answer (content is missing, null, empty or non-text; finish_reason=" +
+        reply.finishReason + ")";
+  return reply;
+}
+
+// Keep the provided ChatClient utility unchanged: search needs raw responses
+// and tolerant decoding, while its outer loop owns retries and call budgets.
+SearchModelReply requestSearchReply(const ChatClientConfig& config,
+                                    const std::string& system, const std::string& user) {
+  auto reply = SearchModelReply{};
+  auto handle = utilities::chatClientDetail::EasyHandle{curl_easy_init()};
+  if (!handle) { reply.error = "curl_easy_init failed"; return reply; }
+  auto headers = utilities::chatClientDetail::HeaderList{
+      curl_slist_append(nullptr, "Content-Type: application/json")};
+  if (!config.apiKey.empty())
+    headers.reset(curl_slist_append(headers.release(), ("Authorization: Bearer " + config.apiKey).c_str()));
+  const auto url = config.baseUrl + "/chat/completions";
+  const auto payload = json{{"model", config.model}, {"temperature", config.temperature},
+      {"max_tokens", config.maxTokens}, {"messages", json::array({
+          {{"role", "system"}, {"content", system}}, {{"role", "user"}, {"content", user}}})}}.dump();
+  curl_easy_setopt(handle.get(), CURLOPT_URL, url.c_str());
+  curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get());
+  curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDS, payload.c_str());
+  curl_easy_setopt(handle.get(), CURLOPT_POSTFIELDSIZE, static_cast<long>(payload.size()));
+  curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, utilities::chatClientDetail::appendToString);
+  curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &reply.raw);
+  curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT, config.timeoutSeconds);
+  const auto performed = curl_easy_perform(handle.get());
+  curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &reply.httpStatus);
+  if (performed != CURLE_OK) reply.error = std::string{"transport: "} + curl_easy_strerror(performed);
+  else if (reply.httpStatus != 200)
+    reply.error = "http " + std::to_string(reply.httpStatus) + ": " + reply.raw.substr(0, 300);
+  else {
+    const auto status = reply.httpStatus;
+    reply = parseModelResponse(reply.raw);
+    reply.httpStatus = status;
+  }
+  return reply;
 }
 
 std::string systemPrompt() {
@@ -848,34 +1091,38 @@ int runSearch(const Options& options, ChatClientConfig config, double minEffect,
           parent.score, bestOfN ? 1.0 : bestRetained.score, meta.at("baseline_ms").get<double>(),
           bestOfN ? std::string{} : failure, options.promptHints);
       saveJson(stem.string() + ".prompt.json", {{"system", system}, {"user", user}});
-      auto reply = ModelReply{};
-      // Retry here rather than inside ChatClient so credits.csv counts every
-      // HTTP request, including errors. Unknown usage on failed calls remains
-      // unknown; we never invent token counts.
-      auto single = config;
-      single.retries = 1;
+      auto reply = SearchModelReply{};
+      auto code = std::string{};
+      auto includes = std::string{};
+      // Count every HTTP request, including retries for empty or unparseable
+      // answers. Retain the same prompt and global call cap in both search modes.
       const auto callsBefore = calls;
       for (int retry = 0; retry < config.retries; ++retry) {
         if (callBudget > 0 && calls >= callBudget) break;
         ++calls;
-        reply = requestModelReply(single, system, user);
+        reply = requestSearchReply(config, system, user);
         promptTokens += reply.promptTokens;
         completionTokens += reply.completionTokens;
         totalTokens += reply.totalTokens;
+        splitReply(reply.content, &code, &includes);
+        if (reply.error.empty() && code.empty()) reply.error = "reply contains no complete function";
+        const auto rawPath = stem.string() + ".call_" + std::to_string(retry + 1) + ".response.txt";
+        writeFile(rawPath, reply.raw);
         saveJson(stem.string() + ".call_" + std::to_string(retry + 1) + ".json",
             {{"content", reply.content}, {"error", reply.error},
+             {"raw_response_file", rawPath}, {"http_status", reply.httpStatus},
+             {"finish_reason", reply.finishReason}, {"content_source", reply.contentSource},
              {"prompt_tokens", reply.promptTokens}, {"completion_tokens", reply.completionTokens},
              {"total_tokens", reply.totalTokens}});
-        if (reply.error.empty() && !reply.content.empty()) break;
+        if (reply.error.empty()) break;
         if (reply.error.rfind("http 4", 0) == 0 && reply.error.rfind("http 429", 0) != 0) break;
         if (retry + 1 < config.retries && (callBudget == 0 || calls < callBudget))
           usleep(static_cast<unsigned int>(2 * (retry + 1) * 1000000));
       }
       record["calls"] = calls - callsBefore;
+      record["llm_finish_reason"] = reply.finishReason;
+      record["llm_content_source"] = reply.contentSource;
       writeFile(stem.string() + ".reply.txt", reply.content);
-      auto code = std::string{};
-      auto includes = std::string{};
-      splitReply(reply.content, &code, &includes);
       if (!reply.error.empty() || code.empty()) {
         record["stage"] = "llm";
         record["error"] = reply.error.empty() ? "reply contains no complete function" : reply.error;
